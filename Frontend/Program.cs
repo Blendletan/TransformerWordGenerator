@@ -107,27 +107,23 @@ namespace Frontend
             Console.WriteLine($"Next character after '{prefix}': " + string.Join(", ",
                 highest.Select(id => $"{(id == 2 ? "<END>" : WordEncoding.Decode(id).ToString())}: {probabilities[id]:P1}")));
         }
-        static void Train()
+        static void Train(string dictionaryFilePath, int maxLetters, int dimension,int ffSize)
         {
-            const string filePath = "words.txt";
-            int maxLetters = 22;
-            const int epochs = 10;
-            var words = WordData.ReadWords(filePath, maxLetters);
+            const int epochs = 500;
+            var words = WordData.ReadWords(dictionaryFilePath, maxLetters);
             maxLetters = words.OrderByDescending(w => w.Length).First().Length;
             var (train, val) = WordData.Split(words, maxLetters, 4);
             const int batchSize = 64;
-            const int d = 24;
-            const int ffSize = 48;
             const int seed = 12345;
             const double learningRate = 0.0005;
             string checkpointPath = $"best-word-model-{maxLetters}.dat";
             Console.WriteLine($"Words: {words.Length} | Training: {train.Length} | Validation: {val.Length}");
-            Console.WriteLine($"Model: D={d}, one attention head, 2 blocks, FF={ffSize}");
+            Console.WriteLine($"Model: D={dimension}, one attention head, 2 blocks, FF={ffSize}");
             Console.WriteLine($"Vocabulary: {WordEncoding.VocabularySize} | Context: {maxLetters + 1}");
             torch.manual_seed(seed);
             var device = torch.cuda.is_available() ? torch.CUDA : torch.CPU;
             Console.WriteLine($"Device: {device}");
-            using var model = new CharacterTransformer(maxLetters + 1, d, ffSize);
+            using var model = new CharacterTransformer(maxLetters + 1, dimension, ffSize);
             model.to(device);
             using var lossFunction = CrossEntropyLoss(ignore_index: -100);
             using var optimizer = torch.optim.Adam(model.parameters(), lr: learningRate);
@@ -188,9 +184,67 @@ namespace Frontend
             string formattedTimeElapsed = sw.Elapsed.ToString(@"dd\.hh\:mm\:ss");
             Console.WriteLine($"Training took {formattedTimeElapsed} (dd.hh:mm:ss)");
         }
+        static void EstimateDimension(string dictionaryFilePath, int maxLetters, int dimension, int ffSize, int prefixLength, string checkpointPath)
+        {
+            var words = WordData.ReadWords(dictionaryFilePath, maxLetters);
+            var rng = new Random(42);
+            int sampleSize = 30000;
+            var prefixes = words
+                .Where(w => w.Length >= prefixLength)
+                .Select(w => w[..prefixLength])
+                .Distinct()
+                .OrderBy(_ => rng.Next())
+                .Take(sampleSize)
+                .ToList();
+            var device = torch.cuda.is_available() ? torch.CUDA : torch.CPU;
+            Console.WriteLine($"Device: {device}");
+            using var model = new CharacterTransformer(maxLetters + 1, dimension, ffSize);
+            model.to(device);
+            model.load(checkpointPath);
+            model.eval();
+            var vectors = new List<float[]>();
+            using (torch.no_grad())
+            {
+                foreach (string prefix in prefixes)
+                {
+                    using var scope = torch.NewDisposeScope();
+                    // Use your existing character tokenizer here.
+                    // Expected shape: [1, prefixLength]
+                    var ids = new long[1, prefix.Length + 1];
+                    ids[0, 0] = WordEncoding.Start;
+                    for (int i = 0; i < prefix.Length; i++)
+                        ids[0, i + 1] = WordEncoding.Letter(prefix[i]);
+                    var tokens = torch.tensor(ids).to(device);
+                    // Expected shape: [1, prefixLength, 29]
+                    Tensor logits = model.forward(tokens);
+                    // The next-character logits after the last input token.
+                    Tensor lastLogits = logits
+                        .select(0, 0)
+                        .select(0, tokens.shape[1] - 1);
+
+                    Tensor probabilities = lastLogits.softmax(0);
+
+                    float[] vector = probabilities
+                        .cpu()
+                        .contiguous()
+                        .data<float>()
+                        .ToArray();
+                    vectors.Add(vector);
+                }
+            }
+
+            double dataManifoldDimension = TwoNN.Estimate(vectors);
+            Console.WriteLine($"Estimated dimension: {dataManifoldDimension:F2}");
+        }
         static void Main(string[] args)
         {
-            Train();
+            const string dictionaryFilePath = "words.txt";
+            const int d = 64;
+            const int ffSize = 1024;
+            const int maxLetters = 15;
+            const int prefixLength = 8;
+            Train(dictionaryFilePath, maxLetters, d, ffSize);
+            //EstimateDimension(dictionaryFilePath,maxLetters,d,ffSize, prefixLength,"best-word-model-15.dat");
         }
     }
 }
